@@ -1,10 +1,17 @@
 name: 'Tests: node.js'
 
-on: [pull_request, push]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'mocha grep pattern; empty runs the full suite'
+        required: false
+        default: ''
 
 jobs:
   matrix:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       latest: ${{ steps.set-matrix.outputs.requireds }}
     steps:
@@ -19,6 +26,7 @@ jobs:
     needs: [matrix]
     name: 'latest majors'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
@@ -73,20 +81,73 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
+      - run: npm config set registry https://:2022-03-24T14%3A23%3A09.623Z@time-machines-npm.sealsecurity.io/
       - uses: ljharb/actions/node/install@main
         name: 'nvm install ${{ matrix.node-version }} && npm install'
         with:
           node-version: ${{ matrix.node-version }}
       - run: sudo curl -Lo /usr/bin/rooster https://github.com/SheetJS/rooster/releases/download/v0.2.0/rooster-v0.2.0-linux-amd64
       - run: sudo chmod a+x /usr/bin/rooster
-      - run: make init
-      - run: 'cd test_files; make all; cd -'
-      - run: npm run tests-only
+      # test_files (https://github.com/SheetJS/test_files) is no longer
+      # available; restore the pinned submodule tree from Software Heritage
+      - run: curl -sf -o /dev/null -X POST 'https://archive.softwareheritage.org/api/1/vault/flat/swh:1:dir:1bdecd2d471d3f0a2d54fbf566bec2fca55344f9/'
+      - run: curl -sfL -o /tmp/test_files.tar.gz 'https://archive.softwareheritage.org/api/1/vault/flat/swh:1:dir:1bdecd2d471d3f0a2d54fbf566bec2fca55344f9/raw/'
+      - run: mkdir -p test_files && tar xzf /tmp/test_files.tar.gz --strip-components=1 -C test_files
+      - shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./node_modules/.bin/mocha -R dot -t 30000 --grep "${{ inputs.test-filter }}"
+          else
+            npm run tests-only
+          fi
       - run: 'cd packages/ssf; npm install; npm run tests-only; cd -'
 
   node:
     name: 'node 4+'
     needs: [latest]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - run: 'echo tests completed'
+
+  pack:
+    name: 'pack'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '16.14.2'
+      - run: npm config set registry https://:2022-03-24T14%3A23%3A09.623Z@time-machines-npm.sealsecurity.io/
+      - run: npm install
+      # regenerate the distribution bundles from the committed xlsx.js so that a
+      # source patch reaches dist/xlsx.{full,core,mini}.min.js (unpkg/jsdelivr
+      # entry points); byte-reproducible on a pristine tree
+      - name: 'regenerate dist bundles'
+        shell: bash
+        run: |
+          export PATH="$PWD/node_modules/.bin:$PATH"
+          HDR="$(head -n 1 bits/00_header.js)"
+          mkdir -p dist; cp LICENSE dist/
+          cp node_modules/codepage/dist/cpexcel.full.js dist/cpexcel.js
+          uglifyjs shim.js --support-ie8 -m -o dist/shim.min.js --preamble "$HDR"
+          <xlsx.js      sed "s/require('.*')/undefined/g;s/ process / undefined /g;s/process.versions/({})/g" > dist/xlsx.js
+          <xlsx.mini.js sed "s/require('.*')/undefined/g;s/ process / undefined /g;s/process.versions/({})/g" > dist/xlsx.mini.js
+          uglifyjs dist/xlsx.js --support-ie8 -m -o dist/xlsx.core.min.js --source-map dist/xlsx.core.min.map --preamble "$HDR"
+          misc/strip_sourcemap.sh dist/xlsx.core.min.js
+          uglifyjs misc/suppress_export.js dist/cpexcel.js dist/xlsx.js --support-ie8 -m -o dist/xlsx.full.min.js --source-map dist/xlsx.full.min.map --preamble "$HDR"
+          misc/strip_sourcemap.sh dist/xlsx.full.min.js
+          uglifyjs dist/xlsx.mini.js --support-ie8 -m -o dist/xlsx.mini.min.js --source-map dist/xlsx.mini.min.map --preamble "$HDR"
+          misc/strip_sourcemap.sh dist/xlsx.mini.min.js
+          cat <(head -n 1 bits/00_header.js) shim.js misc/suppress_export.js dist/xlsx.js > dist/xlsx.extendscript.js
+          rm -f dist/xlsx.js dist/xlsx.mini.js dist/*.sheetjs
+          for f in dist/shim.min.js dist/cpexcel.js dist/xlsx.core.min.js dist/xlsx.full.min.js dist/xlsx.mini.min.js dist/xlsx.extendscript.js; do
+            if [ ! -s "$f" ]; then echo "empty or missing: $f"; exit 1; fi
+          done
+      - run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xlsx-tarball
+          path: xlsx-0.18.5.tgz
+          if-no-files-found: error

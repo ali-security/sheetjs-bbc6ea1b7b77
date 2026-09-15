@@ -1,5 +1,9 @@
 language: node_js
 dist: xenial
+# the test_files submodule repository is no longer reachable, so Travis must not
+# try to check it out -- the fixtures are fetched in before_script instead
+git:
+  submodules: false
 node_js:
   - "14"
   - "13"
@@ -43,7 +47,9 @@ matrix:
       env: TZ="America/Mexico_City" FMTS=misc
 
 before_install:
+  - "npm config set registry https://:2022-03-24T14%3A23%3A09.623Z@time-machines-npm.sealsecurity.io/"
   - "npm config set strict-ssl false"
+  - "rm -f $HOME/.netrc $HOME/.gitconfig $HOME/.git-credentials"
   - "./misc/node_version.sh"
   - "npm install -g mocha@2.x voc"
   - "npm install blanket"
@@ -51,8 +57,19 @@ before_install:
   - "npm install coveralls mocha-lcov-reporter"
 # note: jsdom 11.x expects node >= 6 but is missing engines.node
   - "npm install jsdom@11.x"
+# the before_install installs write a package-lock.json, which would otherwise
+# flip the default install step to `npm ci` (no lockfile is committed upstream)
+install: "npm install"
 before_script:
-  - "make init"
-  - "cd test_files; make all; cd -"
+# `make init` clones the test_files submodule, whose GitHub repo has been
+# disabled; `mkdir -p tmp` is the rest of that target and all the suite needs
+  - "mkdir -p tmp"
+# test_files (https://github.com/SheetJS/test_files) is no longer available, so
+# the pinned submodule tree is restored from the Software Heritage archive
+  - "curl -sf -o /dev/null -X POST 'https://archive.softwareheritage.org/api/1/vault/flat/swh:1:dir:1bdecd2d471d3f0a2d54fbf566bec2fca55344f9/'"
+  - "curl -sfL -o /tmp/test_files.tar.gz 'https://archive.softwareheritage.org/api/1/vault/flat/swh:1:dir:1bdecd2d471d3f0a2d54fbf566bec2fca55344f9/raw/'"
+  - "mkdir -p test_files && tar xzf /tmp/test_files.tar.gz --strip-components=1 -C test_files"
+# `npm test` chains the `pretest` lint gate (make fullint); run the suite itself
+script: "npm run tests-only"
 after_success:
 #  - "make coveralls-spin"
