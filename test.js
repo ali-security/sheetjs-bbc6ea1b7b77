@@ -2587,3 +2587,218 @@ mft.forEach(function(x) {
 		case "yes-formula": formulae = true; break;
 	}});
 }); });
+
+/* CVE-2024-22363: the XML/HTML/RTF readers used regular expressions whose
+   backtracking is quadratic (and in two places cubic) in the length of the
+   input, so a small crafted file pinned the event loop for minutes.  Every
+   test below feeds the matching attack string through the public API and
+   asserts BOTH that the parse result is still correct AND that the call
+   finished within a wall-clock budget -- the unpatched parsers need tens of
+   seconds for the very same inputs. */
+describe('CVE-2024-22363 ReDoS', function() {
+	var bef = (function() { if(!X) X = require(modp); });
+	if(typeof before != 'undefined') before(bef);
+	else it('before', bef);
+
+	/* every hardened path is linear, so these inputs take a few ms */
+	var BUDGET = 5000;
+	var t0 = 0;
+	function tick() { t0 = (new Date()).getTime(); }
+	function tock(what) {
+		var d = (new Date()).getTime() - t0;
+		if(d >= BUDGET) throw new Error(what + " took " + d + "ms (budget " + BUDGET + "ms)");
+	}
+	function rep(s, n) { return new Array(n + 1).join(s); }
+	function grab(f) { try { f(); return null; } catch(e) { return e; } }
+
+	/* --- minimal STORED-entry ZIP writer (the reader does not verify CRCs) --- */
+	function zw16(n) { return String.fromCharCode(n & 255, (n >> 8) & 255); }
+	function zw32(n) { return String.fromCharCode(n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >> 24) & 255); }
+	function mkzip(files) {
+		var local = "", central = "", off = 0, i = 0;
+		for(i = 0; i < files.length; ++i) {
+			var name = files[i][0], data = files[i][1];
+			var hdr = "PK\x03\x04" + zw16(20) + zw16(0) + zw16(0) + zw16(0) + zw16(0) +
+				zw32(0) + zw32(data.length) + zw32(data.length) + zw16(name.length) + zw16(0) + name;
+			central += "PK\x01\x02" + zw16(20) + zw16(20) + zw16(0) + zw16(0) + zw16(0) + zw16(0) +
+				zw32(0) + zw32(data.length) + zw32(data.length) + zw16(name.length) +
+				zw16(0) + zw16(0) + zw16(0) + zw16(0) + zw32(0) + zw32(off) + name;
+			local += hdr + data;
+			off += hdr.length + data.length;
+		}
+		return local + central + "PK\x05\x06" + zw16(0) + zw16(0) +
+			zw16(files.length) + zw16(files.length) + zw32(central.length) + zw32(off) + zw16(0);
+	}
+
+	/* --- minimal XLSX package: one shared string "SheetJS" in Sheet1!A1 --- */
+	var ONS = "http://schemas.openxmlformats.org/";
+	var PART_CT = '<?xml version="1.0"?><Types xmlns="' + ONS + 'package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/>' +
+		'<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+		'<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+		'<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+		'<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>' +
+		'<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>' +
+		'<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>' +
+		'<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>';
+	var PART_RELS = '<?xml version="1.0"?><Relationships xmlns="' + ONS + 'package/2006/relationships">' +
+		'<Relationship Id="rId1" Type="' + ONS + 'officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+		'<Relationship Id="rId2" Type="' + ONS + 'officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>' +
+		'<Relationship Id="rId3" Type="' + ONS + 'package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>';
+	var PART_WB = '<?xml version="1.0"?><workbook xmlns="' + ONS + 'spreadsheetml/2006/main" xmlns:r="' + ONS + 'officeDocument/2006/relationships">' +
+		'<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>';
+	var PART_WBR = '<?xml version="1.0"?><Relationships xmlns="' + ONS + 'package/2006/relationships">' +
+		'<Relationship Id="rId1" Type="' + ONS + 'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+		'<Relationship Id="rId2" Type="' + ONS + 'officeDocument/2006/relationships/styles" Target="styles.xml"/>' +
+		'<Relationship Id="rId3" Type="' + ONS + 'officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>' +
+		'<Relationship Id="rId4" Type="' + ONS + 'officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/></Relationships>';
+	var PART_WS = '<?xml version="1.0"?><worksheet xmlns="' + ONS + 'spreadsheetml/2006/main"><dimension ref="A1"/>' +
+		'<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>';
+	var PART_CORE = '<?xml version="1.0"?><cp:coreProperties xmlns:cp="' + ONS + 'package/2006/metadata/core-properties" ' +
+		'xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>SheetJS</dc:creator></cp:coreProperties>';
+	var PART_APP = '<?xml version="1.0"?><Properties xmlns="' + ONS + 'officeDocument/2006/extended-properties"><Company>SheetJS</Company></Properties>';
+	var PART_STY = '<?xml version="1.0"?><styleSheet xmlns="' + ONS + 'spreadsheetml/2006/main">' +
+		'<numFmts count="1"><numFmt numFmtId="164" formatCode="0.000"/></numFmts>' +
+		'<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>';
+	var PART_SST = '<?xml version="1.0"?><sst xmlns="' + ONS + 'spreadsheetml/2006/main" count="1" uniqueCount="1"><si><r><t>SheetJS</t></r></si></sst>';
+	var PART_THM = '<?xml version="1.0"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>' +
+		'<a:clrScheme name="x"></a:clrScheme><a:fontScheme name="x"></a:fontScheme><a:fmtScheme name="x"></a:fmtScheme></a:themeElements></a:theme>';
+	function mkxlsx(o) {
+		o = o || {};
+		return mkzip([
+			["[Content_Types].xml", PART_CT],
+			["_rels/.rels", PART_RELS],
+			["docProps/app.xml", o.app || PART_APP],
+			["docProps/core.xml", o.core || PART_CORE],
+			["xl/workbook.xml", PART_WB],
+			["xl/_rels/workbook.xml.rels", PART_WBR],
+			["xl/styles.xml", o.sty || PART_STY],
+			["xl/sharedStrings.xml", o.sst || PART_SST],
+			["xl/theme/theme1.xml", o.thm || PART_THM],
+			["xl/worksheets/sheet1.xml", o.ws || PART_WS]
+		]);
+	}
+	/* every payload below must still yield this exact workbook */
+	function check_xlsx(wb) {
+		assert.equal(wb.SheetNames.join(","), "Sheet1");
+		assert.equal(get_cell(wb.Sheets.Sheet1, "A1").v, "SheetJS");
+		assert.equal(wb.Props.Company, "SheetJS");
+		assert.equal(wb.Props.Author, "SheetJS");
+	}
+	var xopts = {type:"binary", cellStyles:true};
+
+	it('should parse the control XLSX package', function() {
+		check_xlsx(X.read(mkxlsx(), xopts));
+	});
+
+	it('should not hang on unterminated HTML comments', function() {
+		/* html_to_sheet used /<!--.*?-->/g */
+		var payload = "<table><tr><td>SheetJS</td></tr>" + rep("<!--", 100000) + "</table>";
+		tick();
+		var wb = X.read(payload, {type:"string"});
+		tock("HTML comment strip");
+		assert.equal(get_cell(wb.Sheets[wb.SheetNames[0]], "A1").v, "SheetJS");
+	});
+
+	it('should not hang on unterminated HTML table tags', function() {
+		/* html_to_workbook used /<table[\s\S]*?>[\s\S]*?<\/table>/gi (cubic) */
+		var payload = "<table>" + rep("<table q>", 4000);
+		tick();
+		var e = grab(function() { X.read(payload, {type:"string"}); });
+		tock("HTML table scan");
+		if(!e || e.message.indexOf("could not find <table>") == -1) throw new Error("expected 'could not find <table>', got " + (e && e.message));
+		/* well-formed multi-table HTML must still split into one sheet per table */
+		var wb = X.read("<table><tr><td>Sheet</td></tr></table><table><tr><td>JS</td></tr></table>", {type:"string"});
+		assert.equal(wb.SheetNames.length, 2);
+		assert.equal(get_cell(wb.Sheets[wb.SheetNames[0]], "A1").v, "Sheet");
+		assert.equal(get_cell(wb.Sheets[wb.SheetNames[1]], "A1").v, "JS");
+	});
+
+	it('should not hang on unterminated SpreadsheetML comments', function() {
+		/* parse_xlml_xml used /<!--([\s\S]*?)-->/mg */
+		var base = X.utils.book_new();
+		X.utils.book_append_sheet(base, X.utils.aoa_to_sheet([["SheetJS"]]), "Sheet1");
+		var payload = X.write(base, {bookType:"xlml", type:"string"}) + rep("<!--", 90000);
+		tick();
+		var wb = X.read(payload, {type:"string"});
+		tock("XLML comment strip");
+		assert.equal(get_cell(wb.Sheets[wb.SheetNames[0]], "A1").v, "SheetJS");
+	});
+
+	it('should not hang on unterminated RTF rows', function() {
+		/* rtf_to_sheet_str used /\\trowd.*?\\row\b/g */
+		var base = X.utils.book_new();
+		X.utils.book_append_sheet(base, X.utils.aoa_to_sheet([["SheetJS"]]), "Sheet1");
+		var payload = X.write(base, {bookType:"rtf", type:"string"}) + rep("\\trowd", 90000);
+		tick();
+		var wb = X.read(payload, {type:"string"});
+		tock("RTF row scan");
+		assert.equal(get_cell(wb.Sheets[wb.SheetNames[0]], "A1").v, "SheetJS");
+	});
+
+	it('should not hang on unterminated extended property tags', function() {
+		/* parse_ext_props used the cached matchtag regexp */
+		var app = PART_APP.replace("</Properties>", rep("<Application>", 70000) + "</Properties>");
+		tick();
+		var wb = X.read(mkxlsx({app:app}), xopts);
+		tock("docProps/app.xml scan");
+		check_xlsx(wb);
+	});
+
+	it('should not hang on unterminated core property tags', function() {
+		/* parse_core_props used CORE_PROPS_REGEX */
+		var core = PART_CORE.replace("</cp:coreProperties>", rep("<dc:title>", 80000) + "</cp:coreProperties>");
+		tick();
+		var wb = X.read(mkxlsx({core:core}), xopts);
+		tock("docProps/core.xml scan");
+		check_xlsx(wb);
+	});
+
+	it('should not hang on unterminated vector property tags', function() {
+		/* parseVector used the cached vtregex */
+		var app = PART_APP.replace("</Properties>",
+			'<HeadingPairs><vt:vector size="2" baseType="variant" xmlns:vt="x">' +
+			'<vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant>' +
+			'</vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="1" baseType="lpstr" xmlns:vt="x">' +
+			'<vt:lpstr>Sheet1</vt:lpstr>' + rep("<vt:lpstr>", 50000) + '</vt:vector></TitlesOfParts></Properties>');
+		tick();
+		var wb = X.read(mkxlsx({app:app}), xopts);
+		tock("extended property vector scan");
+		check_xlsx(wb);
+	});
+
+	it('should not hang on unterminated sheetViews tags', function() {
+		/* parse_ws_xml used svsregex */
+		var ws = PART_WS.replace("<dimension", rep("<sheetViews>", 35000) + "<dimension");
+		tick();
+		var wb = X.read(mkxlsx({ws:ws}), xopts);
+		tock("sheetViews scan");
+		check_xlsx(wb);
+	});
+
+	it('should not hang on unterminated sheetPr tags', function() {
+		/* parse_ws_xml used sheetprregex2 */
+		var ws = PART_WS.replace("<dimension", rep("<sheetPr>", 40000) + "<dimension");
+		tick();
+		var wb = X.read(mkxlsx({ws:ws}), xopts);
+		tock("sheetPr scan");
+		check_xlsx(wb);
+	});
+
+	it('should not hang on repeated DOCTYPE declarations', function() {
+		/* parse_sty_xml used /<!DOCTYPE[^\[]*\[[^\]]*\]>/gm */
+		var sty = rep("<!DOCTYPE", 40000) + PART_STY;
+		tick();
+		var wb = X.read(mkxlsx({sty:sty}), xopts);
+		tock("styles DOCTYPE strip");
+		check_xlsx(wb);
+	});
+
+	it('should not hang on unterminated rPh tags', function() {
+		/* parse_si used /<(?:\w+:)?rPh.*?>([\s\S]*?)<\/(?:\w+:)?rPh>/g (cubic) */
+		var sst = PART_SST.replace("</r>", "</r>" + rep("<rPh>", 3000));
+		tick();
+		var wb = X.read(mkxlsx({sst:sst}), xopts);
+		tock("sharedStrings rPh strip");
+		check_xlsx(wb);
+	});
+});
