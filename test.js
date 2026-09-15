@@ -17,6 +17,7 @@ var X;
 var modp = './';
 var fs = require('fs'), assert = require('assert');
 describe('source',function(){it('should load',function(){X=require(modp);});});
+if(typeof before != 'undefined') before(function(){ if(!X) X = require(modp); });
 var DIF_XL = true;
 
 var browser = typeof document !== 'undefined';
@@ -2800,5 +2801,178 @@ describe('CVE-2024-22363 ReDoS', function() {
 		var wb = X.read(mkxlsx({sst:sst}), xopts);
 		tock("sharedStrings rPh strip");
 		check_xlsx(wb);
+	});
+});
+
+/* CVE-2023-30533: sheet_insert_comments looked the anchor cell up with the raw
+   `ref` attribute of a <comment> (or <threadedComment>) element, so a comment
+   anchored at ref="__proto__" made sheet["__proto__"] resolve to
+   Object.prototype.  That is truthy, so the "create a new cell" branch was
+   skipped and the very next line -- `if(!cell.c) cell.c = []` -- wrote straight
+   onto the prototype, handing every object in the process a `c` property.
+   decode_cell only accumulates 0-9 and A-Z and then subtracts one, so any ref
+   that is not a real address decodes to {r:-1,c:-1}; those are now dropped
+   before the lookup.  Each payload below is a complete XLSX package built in
+   memory: it pollutes on an unpatched build and is inert after the guard. */
+describe('CVE-2023-30533 prototype pollution via comment ref', function() {
+	var bef = (function() { if(!X) X = require(modp); });
+	if(typeof before != 'undefined') before(bef);
+	else it('before', bef);
+
+	/* --- minimal STORED-entry ZIP writer (the reader does not verify CRCs) --- */
+	function pw16(n) { return String.fromCharCode(n & 255, (n >> 8) & 255); }
+	function pw32(n) { return String.fromCharCode(n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >> 24) & 255); }
+	function pzip(files) {
+		var local = "", central = "", off = 0, i = 0;
+		for(i = 0; i < files.length; ++i) {
+			var name = files[i][0], data = files[i][1];
+			var hdr = "PK\x03\x04" + pw16(20) + pw16(0) + pw16(0) + pw16(0) + pw16(0) +
+				pw32(0) + pw32(data.length) + pw32(data.length) + pw16(name.length) + pw16(0) + name;
+			central += "PK\x01\x02" + pw16(20) + pw16(20) + pw16(0) + pw16(0) + pw16(0) + pw16(0) +
+				pw32(0) + pw32(data.length) + pw32(data.length) + pw16(name.length) +
+				pw16(0) + pw16(0) + pw16(0) + pw16(0) + pw32(0) + pw32(off) + name;
+			local += hdr + data;
+			off += hdr.length + data.length;
+		}
+		return local + central + "PK\x05\x06" + pw16(0) + pw16(0) +
+			pw16(files.length) + pw16(files.length) + pw32(central.length) + pw32(off) + pw16(0);
+	}
+
+	/* --- minimal XLSX package: Sheet1!A1 = "hi" plus one comment part --- */
+	var PNS = "http://schemas.openxmlformats.org/";
+	var CMNT_TYPE = PNS + "officeDocument/2006/relationships/comments";
+	var TCMNT_TYPE = "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment";
+	var CMNT_PART = "xl/comments1.xml";
+	var TCMNT_PART = "xl/threadedComments/threadedComment1.xml";
+	function pct(threaded) {
+		return '<?xml version="1.0"?><Types xmlns="' + PNS + 'package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/>' +
+			'<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+			'<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+			(threaded ?
+				'<Override PartName="/' + TCMNT_PART + '" ContentType="application/vnd.ms-excel.threadedcomments+xml"/>' :
+				'<Override PartName="/' + CMNT_PART + '" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>') +
+			'</Types>';
+	}
+	var P_RELS = '<?xml version="1.0"?><Relationships xmlns="' + PNS + 'package/2006/relationships">' +
+		'<Relationship Id="rId1" Type="' + PNS + 'officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
+	var P_WB = '<?xml version="1.0"?><workbook xmlns="' + PNS + 'spreadsheetml/2006/main" xmlns:r="' + PNS + 'officeDocument/2006/relationships">' +
+		'<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>';
+	var P_WBR = '<?xml version="1.0"?><Relationships xmlns="' + PNS + 'package/2006/relationships">' +
+		'<Relationship Id="rId1" Type="' + PNS + 'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>';
+	var P_WS = '<?xml version="1.0"?><worksheet xmlns="' + PNS + 'spreadsheetml/2006/main"><dimension ref="A1"/>' +
+		'<sheetData><row r="1"><c r="A1" t="str"><v>hi</v></c></row></sheetData></worksheet>';
+	function pwsr(threaded) {
+		return '<?xml version="1.0"?><Relationships xmlns="' + PNS + 'package/2006/relationships"><Relationship Id="rId1" Type="' +
+			(threaded ? TCMNT_TYPE + '" Target="../threadedComments/threadedComment1.xml"/>' : CMNT_TYPE + '" Target="../comments1.xml"/>') +
+			'</Relationships>';
+	}
+	/* the `ref` attribute lands in sheet[ref] without any validation */
+	function pcmnt(ref) {
+		return '<?xml version="1.0"?><comments xmlns="' + PNS + 'spreadsheetml/2006/main">' +
+			'<authors><author>a</author></authors><commentList>' +
+			'<comment ref="' + ref + '" authorId="0"><text><t>POLLUTED</t></text></comment>' +
+			'</commentList></comments>';
+	}
+	function ptcmnt(ref) {
+		return '<?xml version="1.0"?><ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">' +
+			'<threadedComment ref="' + ref + '" dT="2023-04-24T00:00:00.00" personId="{00000000-0000-0000-0000-000000000000}" id="{11111111-1111-1111-1111-111111111111}">' +
+			'<text>POLLUTED</text></threadedComment></ThreadedComments>';
+	}
+	function pxlsx(ref, threaded) {
+		return pzip([
+			["[Content_Types].xml", pct(threaded)],
+			["_rels/.rels", P_RELS],
+			["xl/workbook.xml", P_WB],
+			["xl/_rels/workbook.xml.rels", P_WBR],
+			["xl/worksheets/sheet1.xml", P_WS],
+			["xl/worksheets/_rels/sheet1.xml.rels", pwsr(threaded)],
+			[threaded ? TCMNT_PART : CMNT_PART, threaded ? ptcmnt(ref) : pcmnt(ref)]
+		]);
+	}
+
+	/* read the payload, snapshot every pollution probe, then scrub, so that a
+	   failing assertion can never leak a polluted prototype into later tests */
+	function probe(ref, threaded) {
+		var out = ({}/*:any*/);
+		out.err = null; out.wb = null;
+		try { out.wb = X.read(pxlsx(ref, threaded), {type:"binary", WTF:true}); }
+		catch(e) { out.err = e; }
+		out.plain = ({}).c;
+		out.proto = typeof Object.prototype.c;
+		out.ctor = typeof Object.c;
+		out.tostr = typeof Object.prototype.toString.c;
+		try { delete Object.prototype.c; } catch(e) { }
+		try { delete Object.c; } catch(e) { }
+		try { delete Object.prototype.toString.c; } catch(e) { }
+		return out;
+	}
+	/* the payload must still be a readable workbook -- otherwise the parse died
+	   before reaching the sink and the exploit was never actually attempted */
+	function check_clean(r) {
+		if(r.err) throw r.err;
+		assert.equal(r.proto, "undefined");
+		assert.equal(r.plain, undefined);
+		assert.equal(r.ctor, "undefined");
+		assert.equal(r.tostr, "undefined");
+		assert.equal(typeof Object.prototype.c, "undefined");
+		assert.equal(({}).c, undefined);
+		assert.equal(r.wb.SheetNames.length, 1);
+		assert.equal(r.wb.SheetNames[0], "Sheet1");
+		assert.equal(get_cell(r.wb.Sheets.Sheet1, "A1").v, "hi");
+	}
+
+	/* control: the synthetic package really does drive sheet_insert_comments,
+	   so the payload tests below exercise the vulnerable code path for real */
+	it('should attach a comment anchored at a valid ref', function() {
+		var r = probe("A1", false);
+		check_clean(r);
+		var cell = get_cell(r.wb.Sheets.Sheet1, "A1");
+		assert.equal(cell.c.length, 1);
+		assert.equal(cell.c[0].t, "POLLUTED");
+		assert.equal(cell.c[0].a, "a");
+	});
+
+	it('should attach a threaded comment anchored at a valid ref', function() {
+		var r = probe("A1", true);
+		check_clean(r);
+		var cell = get_cell(r.wb.Sheets.Sheet1, "A1");
+		assert.equal(cell.c.length, 1);
+		assert.equal(cell.c[0].t, "POLLUTED");
+		assert.equal(cell.c[0].T, true);
+	});
+
+	it('should not pollute the prototype from a comment ref of __proto__', function() {
+		var r = probe("__proto__", false);
+		check_clean(r);
+		assert.equal(typeof get_cell(r.wb.Sheets.Sheet1, "A1").c, "undefined");
+	});
+
+	it('should not pollute the prototype from a threaded comment ref of __proto__', function() {
+		var r = probe("__proto__", true);
+		check_clean(r);
+		assert.equal(typeof get_cell(r.wb.Sheets.Sheet1, "A1").c, "undefined");
+	});
+
+	/* same sink, different inherited key: sheet["constructor"] is the Object
+	   function and sheet["toString"] is Object.prototype.toString */
+	it('should not tamper with Object from a comment ref of constructor', function() {
+		var r = probe("constructor", false);
+		check_clean(r);
+	});
+
+	it('should not tamper with toString from a comment ref of toString', function() {
+		var r = probe("toString", false);
+		check_clean(r);
+	});
+
+	/* the guard must not over-block: "$A$1" decodes to {r:0,c:0} and survives.
+	   The raw ref stays the lookup key (unchanged upstream behaviour), so the
+	   comment lands on a cell keyed "$A$1" rather than on A1 itself. */
+	it('should still keep a comment anchored at an absolute ref', function() {
+		var r = probe("$A$1", false);
+		check_clean(r);
+		var cell = r.wb.Sheets.Sheet1["$A$1"];
+		assert.equal(cell.c.length, 1);
+		assert.equal(cell.c[0].t, "POLLUTED");
 	});
 });
